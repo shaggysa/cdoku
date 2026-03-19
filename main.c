@@ -6,6 +6,8 @@
 #include <inttypes.h>
 #include <time.h>
 #include <unistd.h>
+#include <sys/mman.h>
+#include <sys/fcntl.h>
 
 #define PUZZLE_SIZE 81
 #define BILLION  1000000000L
@@ -34,10 +36,36 @@ puzzle_reader read_puzzles(const char *filename) {
 
     fseek(file, PUZZLE_FILE_HEADER_SIZE, SEEK_SET);
 
-    char *buff = malloc(CHUNK_SIZE);
-
     uint8_t (*unsolved)[PUZZLE_SIZE] = malloc(num_puzzles * sizeof(uint8_t[PUZZLE_SIZE]));
     uint8_t (*solved)[PUZZLE_SIZE] = malloc(num_puzzles * sizeof(uint8_t[PUZZLE_SIZE]));
+
+
+#ifdef MMAP
+    fclose(file);
+    const int fd = open(filename, O_RDONLY);
+    const char* puzzle_data = mmap(NULL, file_size, PROT_READ, MAP_PRIVATE, fd, 0);
+
+    if (puzzle_data == MAP_FAILED) {
+        perror("mmap");
+        exit(1);
+    }
+
+    for (int i = 0; i < num_puzzles; i++) {
+        const int puzzle_idx = i * PUZZLE_FILE_ROW_SIZE + PUZZLE_FILE_HEADER_SIZE;
+        if (puzzle_data[81 + puzzle_idx] != ',') {
+            printf("Malformed puzzle row %d, exiting. Found %c instead of ',", i, puzzle_data[81 + puzzle_idx]);
+            exit(1);
+        }
+        for (int j = 0; j < 81; j++) {
+                unsolved[i][j] = puzzle_data[j + puzzle_idx] - '0';
+                solved[i][j] = puzzle_data[j + puzzle_idx + 82] - '0';
+        }
+    }
+
+    close(fd);
+
+#else
+    char *buff = malloc(CHUNK_SIZE);
 
     for (int chunk = 0; chunk < (file_size - PUZZLE_FILE_HEADER_SIZE) / CHUNK_SIZE; chunk++) {
         fread(buff, 1, CHUNK_SIZE, file);
@@ -51,13 +79,13 @@ puzzle_reader read_puzzles(const char *filename) {
             }
 
             for (int j = 0; j < 81; j++) {
-                unsolved[p + PUZZLES_PER_CHUNK * chunk][j] = buff[j + puzzle_idx] - '0';
-                solved[p + PUZZLES_PER_CHUNK * chunk][j] = buff[j + puzzle_idx + 82] - '0';
+                unsolved[p + PUZZLES_PER_CHUNK * chunk][0] = buff[j + puzzle_idx] - '0';
+                solved[p + PUZZLES_PER_CHUNK * chunk][0] = buff[j + puzzle_idx + 82] - '0';
             }
         }
     }
-
     free(buff);
+#endif
 
     const puzzle_reader puzzles = {
         num_puzzles,
@@ -75,11 +103,16 @@ void destroy_puzzles(const puzzle_reader reader) {
 
 int main(void) {
 
+#ifdef MMAP
+    printf("Using MMAP for file reading\n");
+#endif
+
+
     struct timespec start, stop;
 
     clock_gettime( CLOCK_REALTIME, &start);
 
-    const puzzle_reader reader = read_puzzles("sudoku.csv");
+    const puzzle_reader reader = read_puzzles("../sudoku.csv");
 
     clock_gettime( CLOCK_REALTIME, &stop);
 
