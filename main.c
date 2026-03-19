@@ -8,11 +8,56 @@
 #include <unistd.h>
 #include <sys/mman.h>
 #include <sys/fcntl.h>
+#include <pthread.h>
 
 #define PUZZLE_SIZE 81
 #define BILLION  1000000000L
 #define PUZZLES_PER_CHUNK 50000
 #define CHUNK_SIZE (PUZZLES_PER_CHUNK * PUZZLE_FILE_ROW_SIZE)
+
+#ifdef MMMAP
+typedef struct puzzle_instructions {
+
+};
+#else
+typedef struct puzzle_instructions {
+    int num_chunks;
+
+    // the file must have been seeked to first puzzle the thread should solve
+    FILE* file;
+
+    // these pointers must match the first position the puzzle expects.
+    uint8_t (*unsolved)[81];
+    uint8_t (*solved)[81];
+
+} puzzle_instructions;
+
+void *read_puzzles(void *args) {
+    const puzzle_instructions instructions = *(puzzle_instructions *)args;
+
+    for (int chunk = 0; chunk < instructions.num_chunks; chunk++) {
+        char *buff = malloc(CHUNK_SIZE);
+            fread(buff, 1, CHUNK_SIZE, instructions.file);
+
+            for (int p = 0; p < PUZZLES_PER_CHUNK; p++) {
+                const int puzzle_idx = p * PUZZLE_FILE_ROW_SIZE;
+
+                if (buff[81 + puzzle_idx] != ',') {
+                    printf("Malformed puzzle row %d, exiting. Found %c instead of ',", p, buff[81 + puzzle_idx]);
+                    exit(1);
+                }
+
+                for (int j = 0; j < 81; j++) {
+                    instructions.unsolved[p + PUZZLES_PER_CHUNK * chunk][j] = buff[j + puzzle_idx] - '0';
+                    instructions.solved[p + PUZZLES_PER_CHUNK * chunk][j] = buff[j + puzzle_idx + 82] - '0';
+                }
+            }
+        free(buff);
+    }
+
+    return NULL;
+}
+#endif
 
 typedef struct puzzle_reader {
     long num_puzzles;
@@ -20,7 +65,9 @@ typedef struct puzzle_reader {
     uint8_t (*solved)[PUZZLE_SIZE];
 } puzzle_reader;
 
-puzzle_reader read_puzzles(const char *filename) {
+
+
+puzzle_reader read_puzzles_threaded(const char *filename, int _max_threads) {
 
     FILE *file = fopen(filename, "rb");
 
@@ -44,6 +91,7 @@ puzzle_reader read_puzzles(const char *filename) {
     fclose(file);
     const int fd = open(filename, O_RDONLY);
     const char* puzzle_data = mmap(NULL, file_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    close(fd);
 
     if (puzzle_data == MAP_FAILED) {
         perror("mmap");
@@ -62,29 +110,20 @@ puzzle_reader read_puzzles(const char *filename) {
         }
     }
 
-    close(fd);
 
 #else
-    char *buff = malloc(CHUNK_SIZE);
+    pthread_t t1;
 
-    for (int chunk = 0; chunk < (file_size - PUZZLE_FILE_HEADER_SIZE) / CHUNK_SIZE; chunk++) {
-        fread(buff, 1, CHUNK_SIZE, file);
+    puzzle_instructions is = {
+        file_size / CHUNK_SIZE, // NOLINT(*-narrowing-conversions)
+        file,
+        unsolved,
+        solved
+    };
 
-        for (int p = 0; p < PUZZLES_PER_CHUNK; p++) {
-            const int puzzle_idx = p * PUZZLE_FILE_ROW_SIZE;
+    pthread_create(&t1, NULL, read_puzzles, &is);
+    pthread_join(t1, NULL);
 
-            if (buff[81 + puzzle_idx] != ',') {
-                printf("Malformed puzzle row %d, exiting. Found %c instead of ',", p, buff[81 + puzzle_idx]);
-                exit(1);
-            }
-
-            for (int j = 0; j < 81; j++) {
-                unsolved[p + PUZZLES_PER_CHUNK * chunk][0] = buff[j + puzzle_idx] - '0';
-                solved[p + PUZZLES_PER_CHUNK * chunk][0] = buff[j + puzzle_idx + 82] - '0';
-            }
-        }
-    }
-    free(buff);
 #endif
 
     const puzzle_reader puzzles = {
@@ -107,12 +146,11 @@ int main(void) {
     printf("Using MMAP for file reading\n");
 #endif
 
-
     struct timespec start, stop;
 
     clock_gettime( CLOCK_REALTIME, &start);
 
-    const puzzle_reader reader = read_puzzles("../sudoku.csv");
+    const puzzle_reader reader = read_puzzles_threaded("../sudoku.csv", 8);
 
     clock_gettime( CLOCK_REALTIME, &stop);
 
@@ -121,6 +159,8 @@ int main(void) {
               / (double)BILLION;
 
     printf("Parsed %ld puzzles in %f milliseconds\n", reader.num_puzzles, delta * 1000);
+
+    printf("%d", reader.solved[8999999][18]);
 
     destroy_puzzles(reader);
 
