@@ -1,1 +1,4 @@
-/cmade-build-debug
+/cmake-build-debug
+/cmake-build-release
+mutagen.yml
+mutagen.yml.lock
