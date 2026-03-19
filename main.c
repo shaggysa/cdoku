@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <inttypes.h>
 #include <time.h>
+#include <unistd.h>
 
 #define PUZZLE_SIZE 81
 #define BILLION  1000000000L
@@ -19,7 +20,7 @@ typedef struct puzzle_reader {
 
 puzzle_reader read_puzzles(const char *filename) {
 
-    FILE *file = fopen(filename, "r");
+    FILE *file = fopen(filename, "rb");
 
     if (file == NULL) {
         perror("Unable to open file");
@@ -38,9 +39,8 @@ puzzle_reader read_puzzles(const char *filename) {
     uint8_t (*unsolved)[PUZZLE_SIZE] = malloc(num_puzzles * sizeof(uint8_t[PUZZLE_SIZE]));
     uint8_t (*solved)[PUZZLE_SIZE] = malloc(num_puzzles * sizeof(uint8_t[PUZZLE_SIZE]));
 
-    // no idea why I need to wrap CHUNK_SIZE in parentheses, but stuff seems to break if I don't
-    for (int chunk = 0; chunk < file_size / CHUNK_SIZE; chunk++) {
-        fread(buff, CHUNK_SIZE, 1, file);
+    for (int chunk = 0; chunk < (file_size - PUZZLE_FILE_HEADER_SIZE) / CHUNK_SIZE; chunk++) {
+        fread(buff, 1, CHUNK_SIZE, file);
 
         for (int p = 0; p < PUZZLES_PER_CHUNK; p++) {
             const int puzzle_idx = p * PUZZLE_FILE_ROW_SIZE;
@@ -51,8 +51,8 @@ puzzle_reader read_puzzles(const char *filename) {
             }
 
             for (int j = 0; j < 81; j++) {
-                unsolved[p][j] = buff[j + puzzle_idx] - '0';
-                solved[p][j] = buff[j + puzzle_idx + 82] - '0';
+                unsolved[p + PUZZLES_PER_CHUNK * chunk][j] = buff[j + puzzle_idx] - '0';
+                solved[p + PUZZLES_PER_CHUNK * chunk][j] = buff[j + puzzle_idx + 82] - '0';
             }
         }
     }
@@ -83,15 +83,11 @@ int main(void) {
 
     clock_gettime( CLOCK_REALTIME, &stop);
 
-    double delta = stop.tv_sec - start.tv_sec
+    const double delta = stop.tv_sec - start.tv_sec // NOLINT(*-narrowing-conversions)
             + (double)( stop.tv_nsec - start.tv_nsec )
               / (double)BILLION;
 
     printf("Parsed %ld puzzles in %f milliseconds\n", reader.num_puzzles, delta * 1000);
-
-    for (int i = 0; i < 81; i++) {
-        printf("%d", reader.unsolved[999][i]);
-    }
 
     destroy_puzzles(reader);
 
