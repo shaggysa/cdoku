@@ -35,8 +35,9 @@ typedef struct puzzle_instructions {
 void *read_puzzles(void *args) {
     const puzzle_instructions instructions = *(puzzle_instructions *)args;
 
+    char *buff = malloc(CHUNK_SIZE);
+
     for (int chunk = 0; chunk < instructions.num_chunks; chunk++) {
-        char *buff = malloc(CHUNK_SIZE);
             fread(buff, 1, CHUNK_SIZE, instructions.file);
 
             for (int p = 0; p < PUZZLES_PER_CHUNK; p++) {
@@ -52,8 +53,9 @@ void *read_puzzles(void *args) {
                     instructions.solved[p + PUZZLES_PER_CHUNK * chunk][j] = buff[j + puzzle_idx + 82] - '0';
                 }
             }
-        free(buff);
     }
+    free(buff);
+
 
     return NULL;
 }
