@@ -67,7 +67,7 @@ typedef struct puzzle_reader {
 
 
 
-puzzle_reader read_puzzles_threaded(const char *filename, int _max_threads) {
+puzzle_reader read_puzzles_threaded(const char *filename, const int num_threads) {
 
     FILE *file = fopen(filename, "rb");
 
@@ -112,17 +112,39 @@ puzzle_reader read_puzzles_threaded(const char *filename, int _max_threads) {
 
 
 #else
-    pthread_t t1;
+    puzzle_instructions *instructions = malloc(sizeof(puzzle_instructions) * num_threads);
+    pthread_t *threads = malloc(sizeof(pthread_t) * num_threads);
 
-    puzzle_instructions is = {
-        file_size / CHUNK_SIZE, // NOLINT(*-narrowing-conversions)
-        file,
-        unsolved,
-        solved
-    };
+    const int total_chunks = (file_size - 15) / CHUNK_SIZE; // NOLINT(*-narrowing-conversions)
 
-    pthread_create(&t1, NULL, read_puzzles, &is);
-    pthread_join(t1, NULL);
+    const int chunks_per_thread = total_chunks / num_threads;
+    const int extra_chunks = total_chunks % num_threads;
+
+    int portioned_chunks = 0;
+
+    for (int i = 0; i < num_threads; i++) {
+        const int thread_chunks = i < extra_chunks ? chunks_per_thread + 1 : chunks_per_thread;
+
+        FILE *thread_file = fopen(filename, "rb");
+        fseek(thread_file, PUZZLE_FILE_HEADER_SIZE + portioned_chunks * CHUNK_SIZE, SEEK_SET);
+
+        instructions[i].file = thread_file;
+        instructions[i].num_chunks = thread_chunks;
+        instructions[i].unsolved = unsolved + portioned_chunks * PUZZLES_PER_CHUNK;
+        instructions[i].solved = solved + portioned_chunks * PUZZLES_PER_CHUNK;
+
+        pthread_create(threads + i, NULL, read_puzzles, instructions + i);
+        portioned_chunks += thread_chunks;
+    }
+
+    // TODO: have the main thread do puzzles that fall outside the last chunk
+
+    for (int i = 0; i < num_threads; i++) {
+        pthread_join(threads[i], NULL);
+    }
+
+    free(instructions);
+    free(threads);
 
 #endif
 
@@ -146,11 +168,20 @@ int main(void) {
     printf("Using MMAP for file reading\n");
 #endif
 
+    const long logical_cores = sysconf(_SC_NPROCESSORS_ONLN);
+    if (logical_cores == -1) {
+        perror("Logical core count unavailable.");
+        exit(1);
+    }
+
+    printf("Logical cores (sysconf): %ld\n", logical_cores);
+
+
     struct timespec start, stop;
 
     clock_gettime( CLOCK_REALTIME, &start);
 
-    const puzzle_reader reader = read_puzzles_threaded("../sudoku.csv", 8);
+    const puzzle_reader reader = read_puzzles_threaded("../sudoku.csv", logical_cores); // NOLINT(*-narrowing-conversions)
 
     clock_gettime( CLOCK_REALTIME, &stop);
 
