@@ -8,6 +8,4 @@
 
 void hello(void);
 
-long get_num_puzzles(FILE *f);
-
 #endif // CDOKU_LIBRARY_H

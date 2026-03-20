@@ -12,7 +12,7 @@
 
 #define PUZZLE_SIZE 81
 #define BILLION  1000000000L
-#define PUZZLES_PER_CHUNK 50000
+#define MAX_PUZZLES_PER_CHUNK 50000
 #define CHUNK_SIZE (PUZZLES_PER_CHUNK * PUZZLE_FILE_ROW_SIZE)
 
 #ifdef MMMAP
@@ -21,7 +21,8 @@ typedef struct puzzle_instructions {
 };
 #else
 typedef struct puzzle_instructions {
-    int num_chunks;
+    long num_chunks;
+    long puzzles_per_chunk;
 
     // the file must have been seeked to first puzzle the thread should solve
     FILE* file;
@@ -34,13 +35,14 @@ typedef struct puzzle_instructions {
 
 void *read_puzzles(void *args) {
     const puzzle_instructions instructions = *(puzzle_instructions *)args;
+    const long chunk_size = instructions.puzzles_per_chunk * PUZZLE_FILE_ROW_SIZE;
 
-    char *buff = malloc(CHUNK_SIZE);
+    char *buff = malloc(chunk_size);
 
-    for (int chunk = 0; chunk < instructions.num_chunks; chunk++) {
-            fread(buff, 1, CHUNK_SIZE, instructions.file);
+    for (long chunk = 0; chunk < instructions.num_chunks; chunk++) {
+            fread(buff, 1, chunk_size, instructions.file);
 
-            for (int p = 0; p < PUZZLES_PER_CHUNK; p++) {
+            for (int p = 0; p < instructions.puzzles_per_chunk; p++) {
                 const int puzzle_idx = p * PUZZLE_FILE_ROW_SIZE;
 
                 if (buff[81 + puzzle_idx] != ',') {
@@ -49,8 +51,8 @@ void *read_puzzles(void *args) {
                 }
 
                 for (int j = 0; j < 81; j++) {
-                    instructions.unsolved[p + PUZZLES_PER_CHUNK * chunk][j] = buff[j + puzzle_idx] - '0';
-                    instructions.solved[p + PUZZLES_PER_CHUNK * chunk][j] = buff[j + puzzle_idx + 82] - '0';
+                    instructions.unsolved[p + instructions.puzzles_per_chunk * chunk][j] = buff[j + puzzle_idx] - '0';
+                    instructions.solved[p + instructions.puzzles_per_chunk * chunk][j] = buff[j + puzzle_idx + 82] - '0';
                 }
             }
     }
@@ -69,12 +71,13 @@ typedef struct puzzle_reader {
 
 
 
-puzzle_reader read_puzzles_threaded(const char *filename, const int num_threads) {
+puzzle_reader read_puzzles_threaded(const char *filename, const long num_threads) {
 
     FILE *file = fopen(filename, "rb");
 
     if (file == NULL) {
-        perror("Unable to open file");
+        perror("Unable to open the puzzle file");
+        exit(1);
     }
 
     fseek(file, 0, SEEK_END);
@@ -117,29 +120,66 @@ puzzle_reader read_puzzles_threaded(const char *filename, const int num_threads)
     puzzle_instructions *instructions = malloc(sizeof(puzzle_instructions) * num_threads);
     pthread_t *threads = malloc(sizeof(pthread_t) * num_threads);
 
-    const int total_chunks = (file_size - 15) / CHUNK_SIZE; // NOLINT(*-narrowing-conversions)
+    const long puzzles_per_chunk = MAX_PUZZLES_PER_CHUNK < num_puzzles / num_threads ? MAX_PUZZLES_PER_CHUNK : num_puzzles / num_threads;
+    const long chunk_size = puzzles_per_chunk * PUZZLE_FILE_ROW_SIZE;
 
-    const int chunks_per_thread = total_chunks / num_threads;
-    const int extra_chunks = total_chunks % num_threads;
+    const long total_chunks = (file_size - 15) / chunk_size;
 
-    int portioned_chunks = 0;
+    const long chunks_per_thread = total_chunks / num_threads;
+    const long extra_chunks = total_chunks % num_threads;
 
-    for (int i = 0; i < num_threads; i++) {
-        const int thread_chunks = i < extra_chunks ? chunks_per_thread + 1 : chunks_per_thread;
+    long allocated_chunks = 0;
+
+    for (long i = 0; i < num_threads; i++) {
+        const long thread_chunks = i < extra_chunks ? chunks_per_thread + 1 : chunks_per_thread;
 
         FILE *thread_file = fopen(filename, "rb");
-        fseek(thread_file, PUZZLE_FILE_HEADER_SIZE + portioned_chunks * CHUNK_SIZE, SEEK_SET);
+
+        if (thread_file == NULL) {
+            perror("Unable to open the puzzle file");
+            exit(1);
+        }
+
+        fseek(thread_file, PUZZLE_FILE_HEADER_SIZE + allocated_chunks * chunk_size, SEEK_SET);
 
         instructions[i].file = thread_file;
+        instructions[i].puzzles_per_chunk = puzzles_per_chunk;
         instructions[i].num_chunks = thread_chunks;
-        instructions[i].unsolved = unsolved + portioned_chunks * PUZZLES_PER_CHUNK;
-        instructions[i].solved = solved + portioned_chunks * PUZZLES_PER_CHUNK;
+        instructions[i].unsolved = unsolved + allocated_chunks * puzzles_per_chunk;
+        instructions[i].solved = solved + allocated_chunks * puzzles_per_chunk;
 
         pthread_create(threads + i, NULL, read_puzzles, instructions + i);
-        portioned_chunks += thread_chunks;
+        allocated_chunks += thread_chunks;
     }
 
-    // TODO: have the main thread do puzzles that fall outside the last chunk
+    // take care of orphaned puzzles in the main thread
+    fseek(file, PUZZLE_FILE_HEADER_SIZE + allocated_chunks * chunk_size, SEEK_SET);
+    const long remaining_size = file_size - ftell(file);
+
+    const long remaining_puzzles = remaining_size / PUZZLE_FILE_ROW_SIZE;
+
+    uint8_t (*offset_unsolved)[81] = unsolved + (num_puzzles - remaining_puzzles);
+    uint8_t (*offset_solved)[81] = solved + (num_puzzles - remaining_puzzles);
+
+    char *buff = malloc(remaining_size);
+
+    fread(buff, 1, remaining_size, file);
+
+    for (long p = 0; p < remaining_puzzles ; p++) {
+        const long puzzle_idx = p * PUZZLE_FILE_ROW_SIZE;
+
+        if (buff[81 + puzzle_idx] != ',') {
+            printf("Malformed puzzle row %ld, exiting. Found %c instead of ',", p, buff[81 + puzzle_idx]);
+            exit(1);
+        }
+
+        for (int j = 0; j < 81; j++) {
+            offset_unsolved[p][j] = buff[j + puzzle_idx] - '0';
+            offset_solved[p][j] = buff[j + puzzle_idx + 82] - '0';
+        }
+    }
+
+    free(buff);
 
     for (int i = 0; i < num_threads; i++) {
         pthread_join(threads[i], NULL);
@@ -183,7 +223,7 @@ int main(void) {
 
     clock_gettime( CLOCK_REALTIME, &start);
 
-    const puzzle_reader reader = read_puzzles_threaded("../sudoku.csv", logical_cores); // NOLINT(*-narrowing-conversions)
+    const puzzle_reader reader = read_puzzles_threaded("../sudoku.csv", logical_cores);
 
     clock_gettime( CLOCK_REALTIME, &stop);
 
@@ -193,7 +233,7 @@ int main(void) {
 
     printf("Parsed %ld puzzles in %f milliseconds\n", reader.num_puzzles, delta * 1000);
 
-    printf("%d", reader.solved[8999999][18]);
+    printf("%d", reader.solved[999][0]);
 
     destroy_puzzles(reader);
 
