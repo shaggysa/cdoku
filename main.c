@@ -45,7 +45,7 @@ void *read_puzzles(void *args) {
         const int puzzle_idx = p * PUZZLE_FILE_ROW_SIZE;
 
         if (buff[81 + puzzle_idx] != ',') {
-            printf("Malformed puzzle row %d, exiting. Found %c instead of ',", p, buff[81 + puzzle_idx]);
+            printf("Malformed puzzle row %d, exiting. Found %c instead of ',\n", p, buff[81 + puzzle_idx]);
             exit(1);
         }
 
@@ -89,20 +89,20 @@ puzzle_reader read_puzzles_threaded(const char *filename, const long num_threads
     uint8_t (*solved)[PUZZLE_SIZE] = malloc(num_puzzles * sizeof(uint8_t[PUZZLE_SIZE]));
 
     if (unsolved == NULL || solved == NULL) {
-        printf("Failed to allocate the solved or unsolved array!");
+        printf("Failed to allocate the solved or unsolved array!\n");
         exit(1);
     }
 
     thread_instructions *instructions = malloc(sizeof(thread_instructions) * num_threads);
     if (instructions == NULL) {
-        printf("failed to allocate thread instructions!");
+        printf("failed to allocate thread instructions!\n");
         exit(1);
     }
 #ifdef _WIN32
     DWORD   *dwThreadIds = malloc(sizeof(DWORD) * num_threads);
     HANDLE  *hThreads = malloc(sizeof(HANDLE) * num_threads);
     if (dwThreadIds == NULL || hThreads == NULL) {
-        printf("failed to allocate windows thread array!");
+        printf("failed to allocate windows thread array!\n");
         exit(1);
     }
 #else
@@ -119,20 +119,20 @@ puzzle_reader read_puzzles_threaded(const char *filename, const long num_threads
 #ifdef _WIN32
     HANDLE file_handle = CreateFileA(filename, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
     if (file_handle == INVALID_HANDLE_VALUE) {
-        printf("failed to create a windows file handle!");
+        printf("failed to create a windows file handle!\n");
         exit(1);
     }
 
     HANDLE file_mapping = CreateFileMappingA(file_handle, NULL, PAGE_READONLY, 0, 0, NULL);
     CloseHandle(file_handle);
     if (file_mapping == NULL) {
-        printf("failed to create a windows file mapping!");
+        printf("failed to create a windows file mapping!\n");
         exit(1);
     }
 
     const char *puzzle_data = MapViewOfFile(file_mapping, FILE_MAP_READ, 0, 0, 0) + PUZZLE_FILE_HEADER_SIZE;
     if (puzzle_data == NULL) {
-        printf("windows file map view failed!");
+        printf("windows file map view failed!\n");
         exit(1);
     }
 #else
@@ -166,7 +166,7 @@ puzzle_reader read_puzzles_threaded(const char *filename, const long num_threads
 #ifdef _WIN32
         hThreads[i] = CreateThread(NULL, 0, read_puzzles, instructions + i, 0, dwThreadIds + i);
         if (hThreads[i] == 0) {
-            printf("failed to create a WINAPI thread!");
+            printf("failed to create a WINAPI thread!\n");
             exit(1);
         }
 #else
@@ -180,16 +180,31 @@ puzzle_reader read_puzzles_threaded(const char *filename, const long num_threads
 #ifdef _WIN32
     WaitForMultipleObjects(num_threads, hThreads, TRUE, INFINITE);
     for (int i = 0; i < num_threads; i++) {
-        CloseHandle(hThreads[i]);
+        if (CloseHandle(hThreads[i]) == 0) {
+            printf("failed to close windows thread\n");
+        }
     }
     free(hThreads);
     free(dwThreadIds);
+
+    // TODO: figure out a way to do this that doesn't double clocked execution time
+    // if (UnmapViewOfFile(puzzle_data - PUZZLE_FILE_HEADER_SIZE) == 0) {
+    //     printf("failed to unmap windows file\n");
+    // }
+
+    // if (CloseHandle(file_mapping) == 0)
+    // {
+    //     printf("failed to close windows file mapping\n");
+    // }
+
 #else
     for (int i = 0; i < num_threads; i++) {
         pthread_join(threads[i], NULL);
     }
     free(threads);
-    munmap(puzzle_data, file_size);
+    if (munmap(puzzle_data - PUZZLE_FILE_HEADER_SIZE, file_size) == -1) {
+        perror("failed to unmap puzzle file");
+    }
 #endif
     free(instructions);
 
