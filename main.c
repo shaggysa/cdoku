@@ -92,17 +92,28 @@ puzzle_reader read_puzzles_threaded(const char *filename, const long num_threads
         printf("failed to create a windows file handle!");
         exit(1);
     }
+
     HANDLE file_mapping = CreateFileMappingA(file_handle, NULL, PAGE_READONLY, 0, 0, NULL);
+    CloseHandle(file_handle);
     if (file_mapping == NULL) {
         printf("failed to create a windows file mapping!");
         exit(1);
     }
-    CloseHandle(file_handle);
-    const char *puzzle_data = MapViewOfFile( file_mapping, FILE_MAP_READ, 0, 0, 0) + PUZZLE_FILE_HEADER_SIZE;
+
+    const char *puzzle_data = MapViewOfFile(file_mapping, FILE_MAP_READ, 0, 0, 0) + PUZZLE_FILE_HEADER_SIZE;
+    if (puzzle_data == NULL) {
+        printf("windows file map view failed!");
+        exit(1);
+    }
 #else
     const int fd = open(filename, O_RDONLY);
-    const char *puzzle_data = mmap(NULL, file_size, PROT_READ, MAP_PRIVATE, fd, 0) + PUZZLE_FILE_HEADER_SIZE;
 
+    if (fd == -1) {
+        perror("file open");
+        exit(1);
+    }
+
+    const char *puzzle_data = mmap(NULL, file_size, PROT_READ, MAP_PRIVATE, fd, 0) + PUZZLE_FILE_HEADER_SIZE;
     close(fd);
 
     if (puzzle_data == MAP_FAILED) {
