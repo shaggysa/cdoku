@@ -143,7 +143,7 @@ puzzle_reader read_puzzles_threaded(const char *filename, const long num_threads
         exit(1);
     }
 
-    const char *puzzle_data = mmap(NULL, file_size, PROT_READ, MAP_PRIVATE, fd, 0) + PUZZLE_FILE_HEADER_SIZE;
+    char *puzzle_data = mmap(NULL, file_size, PROT_READ, MAP_PRIVATE, fd, 0) + PUZZLE_FILE_HEADER_SIZE;
     close(fd);
 
     if (puzzle_data == MAP_FAILED) {
@@ -189,9 +189,9 @@ puzzle_reader read_puzzles_threaded(const char *filename, const long num_threads
         pthread_join(threads[i], NULL);
     }
     free(threads);
+    munmap(puzzle_data, file_size);
 #endif
     free(instructions);
-
 
 #ifdef _WIN32
     CloseHandle(file_mapping - PUZZLE_FILE_HEADER_SIZE);
