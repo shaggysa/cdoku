@@ -3,7 +3,6 @@
 #include <stdlib.h>
 #include <inttypes.h>
 #include <time.h>
-#include <pthread.h>
 
 #define PUZZLE_SIZE 81
 #define BILLION  1000000000L
@@ -16,6 +15,7 @@ long get_processor_count() {
     return GetActiveProcessorCount(ALL_PROCESSOR_GROUPS); // NOLINT(*-narrowing-conversions)
 }
 #else
+#include <pthread.h>
 #include <unistd.h>
 #include <sys/mman.h>
 #include <sys/fcntl.h>
@@ -24,16 +24,20 @@ long get_processor_count() {
 }
 #endif
 
-typedef struct puzzle_instructions {
+typedef struct thread_instructions {
     long num_puzzles;
     const char *puzzle_file;
 
     uint8_t (*unsolved)[81];
     uint8_t (*solved)[81];
-} puzzle_instructions;
-
+} thread_instructions;
+#ifdef _WIN32
+DWORD WINAPI read_puzzles(void *args) {
+#else
 void *read_puzzles(void *args) {
-    const puzzle_instructions instructions = *(puzzle_instructions *)args;
+#endif
+
+    const thread_instructions instructions = *(thread_instructions *)args;
 
     const char *buff = instructions.puzzle_file;
 
@@ -50,8 +54,11 @@ void *read_puzzles(void *args) {
             instructions.solved[p][j] = buff[j + puzzle_idx + 82] - '0';
         }
     }
-
+#ifdef _WIN32
+    return 0;
+#else
     return NULL;
+#endif
 }
 
 
@@ -81,8 +88,31 @@ puzzle_reader read_puzzles_threaded(const char *filename, const long num_threads
     uint8_t (*unsolved)[PUZZLE_SIZE] = malloc(num_puzzles * sizeof(uint8_t[PUZZLE_SIZE]));
     uint8_t (*solved)[PUZZLE_SIZE] = malloc(num_puzzles * sizeof(uint8_t[PUZZLE_SIZE]));
 
-    puzzle_instructions *instructions = malloc(sizeof(puzzle_instructions) * num_threads);
+    if (unsolved == NULL || solved == NULL) {
+        printf("Failed to allocate the solved or unsolved array!");
+        exit(1);
+    }
+
+    thread_instructions *instructions = malloc(sizeof(thread_instructions) * num_threads);
+    if (instructions == NULL) {
+        printf("failed to allocate thread instructions!");
+        exit(1);
+    }
+#ifdef _WIN32
+    DWORD   *dwThreadIds = malloc(sizeof(DWORD) * num_threads);
+    HANDLE  *hThreads = malloc(sizeof(HANDLE) * num_threads);
+    if (dwThreadIds == NULL || hThreads == NULL) {
+        printf("failed to allocate windows thread array!");
+        exit(1);
+    }
+#else
     pthread_t *threads = malloc(sizeof(pthread_t) * num_threads);
+    if (threads == NULL) {
+        printf("failed to allocate thread array!");
+        exit(1);
+    }
+#endif
+
 
     fclose(file);
 
@@ -122,17 +152,35 @@ puzzle_reader read_puzzles_threaded(const char *filename, const long num_threads
         instructions[i].puzzle_file = puzzle_data + allocated_puzzles * PUZZLE_FILE_ROW_SIZE;
         instructions[i].unsolved = unsolved + allocated_puzzles;
         instructions[i].solved = solved + allocated_puzzles;
-
-        pthread_create(threads + i, NULL, read_puzzles, instructions + i);
+#ifdef _WIN32
+        hThreads[i] = CreateThread(NULL, 0, read_puzzles, instructions + i, 0, dwThreadIds + i);
+        if (hThreads[i] == 0) {
+            printf("failed to create a WINAPI thread!");
+            exit(1);
+        }
+#else
+        if (pthread_create(threads + i, NULL, read_puzzles, instructions + i) != 0) {
+            perror("pthread creation");
+            exit(1);
+        }
+#endif
         allocated_puzzles += thread_puzzles;
     }
-
+#ifdef _WIN32
+    WaitForMultipleObjects(num_threads, hThreads, TRUE, INFINITE);
+    for (int i = 0; i < num_threads; i++) {
+        CloseHandle(hThreads[i]);
+    }
+    free(hThreads);
+    free(dwThreadIds);
+#else
     for (int i = 0; i < num_threads; i++) {
         pthread_join(threads[i], NULL);
     }
-
-    free(instructions);
     free(threads);
+#endif
+    free(instructions);
+
 
 #ifdef _WIN32
     CloseHandle(file_mapping - PUZZLE_FILE_HEADER_SIZE);
