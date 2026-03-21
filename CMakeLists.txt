@@ -3,8 +3,6 @@ project(cdoku C)
 
 set(CMAKE_C_STANDARD 99)
 
-option(USE_MMAP "Use memory mapping for file I/O" OFF)
-
 if(USE_MMAP)
     add_definitions(-DMMAP)
 endif()

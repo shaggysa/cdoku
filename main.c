@@ -5,15 +5,48 @@
 #include <stdlib.h>
 #include <inttypes.h>
 #include <time.h>
-#include <unistd.h>
-#include <sys/mman.h>
-#include <sys/fcntl.h>
 #include <pthread.h>
 
 #define PUZZLE_SIZE 81
 #define BILLION  1000000000L
 #define MAX_PUZZLES_PER_CHUNK 50000
 #define CHUNK_SIZE (PUZZLES_PER_CHUNK * PUZZLE_FILE_ROW_SIZE)
+
+#ifdef _WIN32
+#undef MMAP
+#include <windows.h>
+#include <tlhelp32.h>
+long get_processor_count() {
+    // first determine the id of the current process
+    DWORD const  id = GetCurrentProcessId();
+
+    // then get a process list snapshot.
+    HANDLE const  snapshot = CreateToolhelp32Snapshot( TH32CS_SNAPALL, 0 );
+
+    // initialize the process entry structure.
+    PROCESSENTRY32 entry = { 0 };
+    entry.dwSize = sizeof( entry );
+
+    // get the current process info.
+    BOOL  ret = true;
+    ret = Process32First( snapshot, &entry );
+    while( ret && entry.th32ProcessID != id ) {
+        ret = Process32Next( snapshot, &entry );
+    }
+    CloseHandle( snapshot );
+    return ret
+        ?   entry.cntThreads
+        :   -1;
+}
+#else
+#define MMAP
+#include <unistd.h>
+#include <sys/mman.h>
+#include <sys/fcntl.h>
+long get_processor_count() {
+    return sysconf(_SC_NPROCESSORS_ONLN);
+}
+#endif
 
 #ifdef MMAP
 typedef struct puzzle_instructions {
@@ -242,8 +275,8 @@ int main(void) {
 #else
     puts("Reading file chunks into a buffer");
 #endif
+    const long logical_cores = get_processor_count();
 
-    const long logical_cores = sysconf(_SC_NPROCESSORS_ONLN);
     if (logical_cores == -1) {
         perror("Logical core count unavailable.");
         exit(1);
