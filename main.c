@@ -1,5 +1,3 @@
-#include <assert.h>
-
 #include "library.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -13,33 +11,11 @@
 #define CHUNK_SIZE (PUZZLES_PER_CHUNK * PUZZLE_FILE_ROW_SIZE)
 
 #ifdef _WIN32
-#undef MMAP
 #include <windows.h>
-#include <tlhelp32.h>
 long get_processor_count() {
-    // first determine the id of the current process
-    DWORD const  id = GetCurrentProcessId();
-
-    // then get a process list snapshot.
-    HANDLE const  snapshot = CreateToolhelp32Snapshot( TH32CS_SNAPALL, 0 );
-
-    // initialize the process entry structure.
-    PROCESSENTRY32 entry = { 0 };
-    entry.dwSize = sizeof( entry );
-
-    // get the current process info.
-    BOOL  ret = true;
-    ret = Process32First( snapshot, &entry );
-    while( ret && entry.th32ProcessID != id ) {
-        ret = Process32Next( snapshot, &entry );
-    }
-    CloseHandle( snapshot );
-    return ret
-        ?   entry.cntThreads
-        :   -1;
+    return GetActiveProcessorCount(ALL_PROCESSOR_GROUPS); // NOLINT(*-narrowing-conversions)
 }
 #else
-#define MMAP
 #include <unistd.h>
 #include <sys/mman.h>
 #include <sys/fcntl.h>
@@ -48,7 +24,6 @@ long get_processor_count() {
 }
 #endif
 
-#ifdef MMAP
 typedef struct puzzle_instructions {
     long num_puzzles;
     const char *puzzle_file;
@@ -78,48 +53,7 @@ void *read_puzzles(void *args) {
 
     return NULL;
 }
-#else
-typedef struct puzzle_instructions {
-    long num_chunks;
-    long puzzles_per_chunk;
 
-    // the file must have been seeked to first puzzle the thread should solve
-    FILE* file;
-
-    // these pointers must match the first position the puzzle expects.
-    uint8_t (*unsolved)[81];
-    uint8_t (*solved)[81];
-
-} puzzle_instructions;
-
-void *read_puzzles(void *args) {
-    const puzzle_instructions instructions = *(puzzle_instructions *)args;
-    const long chunk_size = instructions.puzzles_per_chunk * PUZZLE_FILE_ROW_SIZE;
-
-    char *buff = malloc(chunk_size);
-
-    for (long chunk = 0; chunk < instructions.num_chunks; chunk++) {
-            fread(buff, 1, chunk_size, instructions.file);
-
-            for (int p = 0; p < instructions.puzzles_per_chunk; p++) {
-                const int puzzle_idx = p * PUZZLE_FILE_ROW_SIZE;
-
-                if (buff[81 + puzzle_idx] != ',') {
-                    printf("Malformed puzzle row %d, exiting. Found %c instead of ',", p, buff[81 + puzzle_idx]);
-                    exit(1);
-                }
-
-                for (int j = 0; j < 81; j++) {
-                    instructions.unsolved[p + instructions.puzzles_per_chunk * chunk][j] = buff[j + puzzle_idx] - '0';
-                    instructions.solved[p + instructions.puzzles_per_chunk * chunk][j] = buff[j + puzzle_idx + 82] - '0';
-                }
-            }
-    }
-    free(buff);
-
-    return NULL;
-}
-#endif
 
 typedef struct puzzle_reader {
     long num_puzzles;
@@ -150,10 +84,24 @@ puzzle_reader read_puzzles_threaded(const char *filename, const long num_threads
     puzzle_instructions *instructions = malloc(sizeof(puzzle_instructions) * num_threads);
     pthread_t *threads = malloc(sizeof(pthread_t) * num_threads);
 
-#ifdef MMAP
     fclose(file);
+
+#ifdef _WIN32
+    HANDLE file_handle = CreateFileA(filename, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (file_handle == INVALID_HANDLE_VALUE) {
+        printf("failed to create a windows file handle!");
+        exit(1);
+    }
+    HANDLE file_mapping = CreateFileMappingA(file_handle, NULL, PAGE_READONLY, 0, 0, NULL);
+    if (file_mapping == NULL) {
+        printf("failed to create a windows file mapping!");
+        exit(1);
+    }
+    CloseHandle(file_handle);
+    const char *puzzle_data = MapViewOfFile( file_mapping, FILE_MAP_READ, 0, 0, 0) + PUZZLE_FILE_HEADER_SIZE;
+#else
     const int fd = open(filename, O_RDONLY);
-    const char* puzzle_data = mmap(NULL, file_size, PROT_READ, MAP_PRIVATE, fd, 0) + PUZZLE_FILE_HEADER_SIZE;
+    const char *puzzle_data = mmap(NULL, file_size, PROT_READ, MAP_PRIVATE, fd, 0) + PUZZLE_FILE_HEADER_SIZE;
 
     close(fd);
 
@@ -161,6 +109,7 @@ puzzle_reader read_puzzles_threaded(const char *filename, const long num_threads
         perror("mmap");
         exit(1);
     }
+#endif
 
     const long puzzles_per_thread = num_puzzles / num_threads;
     const long extra_puzzles = num_puzzles % num_threads;
@@ -182,77 +131,12 @@ puzzle_reader read_puzzles_threaded(const char *filename, const long num_threads
         pthread_join(threads[i], NULL);
     }
 
-
-#else
-
-    const long puzzles_per_chunk = MAX_PUZZLES_PER_CHUNK < num_puzzles / num_threads ? MAX_PUZZLES_PER_CHUNK : num_puzzles / num_threads;
-    const long chunk_size = puzzles_per_chunk * PUZZLE_FILE_ROW_SIZE;
-
-    const long total_chunks = (file_size - 15) / chunk_size;
-
-    const long chunks_per_thread = total_chunks / num_threads;
-    const long extra_chunks = total_chunks % num_threads;
-
-    long allocated_chunks = 0;
-
-    for (long i = 0; i < num_threads; i++) {
-        const long thread_chunks = i < extra_chunks ? chunks_per_thread + 1 : chunks_per_thread;
-
-        FILE *thread_file = fopen(filename, "rb");
-
-        if (thread_file == NULL) {
-            perror("Unable to open the puzzle file");
-            exit(1);
-        }
-
-        fseek(thread_file, PUZZLE_FILE_HEADER_SIZE + allocated_chunks * chunk_size, SEEK_SET);
-
-        instructions[i].file = thread_file;
-        instructions[i].puzzles_per_chunk = puzzles_per_chunk;
-        instructions[i].num_chunks = thread_chunks;
-        instructions[i].unsolved = unsolved + allocated_chunks * puzzles_per_chunk;
-        instructions[i].solved = solved + allocated_chunks * puzzles_per_chunk;
-
-        pthread_create(threads + i, NULL, read_puzzles, instructions + i);
-        allocated_chunks += thread_chunks;
-    }
-
-    // take care of orphaned puzzles in the main thread
-    fseek(file, PUZZLE_FILE_HEADER_SIZE + allocated_chunks * chunk_size, SEEK_SET);
-    const long remaining_size = file_size - ftell(file);
-
-    const long remaining_puzzles = remaining_size / PUZZLE_FILE_ROW_SIZE;
-
-    uint8_t (*offset_unsolved)[81] = unsolved + (num_puzzles - remaining_puzzles);
-    uint8_t (*offset_solved)[81] = solved + (num_puzzles - remaining_puzzles);
-
-    char *buff = malloc(remaining_size);
-
-    fread(buff, 1, remaining_size, file);
-
-    for (long p = 0; p < remaining_puzzles ; p++) {
-        const long puzzle_idx = p * PUZZLE_FILE_ROW_SIZE;
-
-        if (buff[81 + puzzle_idx] != ',') {
-            printf("Malformed puzzle row %ld, exiting. Found %c instead of ',", p, buff[81 + puzzle_idx]);
-            exit(1);
-        }
-
-        for (int j = 0; j < 81; j++) {
-            offset_unsolved[p][j] = buff[j + puzzle_idx] - '0';
-            offset_solved[p][j] = buff[j + puzzle_idx + 82] - '0';
-        }
-    }
-
-    free(buff);
-
-    for (int i = 0; i < num_threads; i++) {
-        pthread_join(threads[i], NULL);
-    }
-
-#endif
     free(instructions);
     free(threads);
+
+#ifdef _WIN32
+    CloseHandle(file_mapping - PUZZLE_FILE_HEADER_SIZE);
+#endif
 
     const puzzle_reader puzzles = {
         num_puzzles,
@@ -269,12 +153,6 @@ void destroy_puzzles(const puzzle_reader reader) {
 }
 
 int main(void) {
-
-#ifdef MMAP
-    puts("Using MMAP for file reading");
-#else
-    puts("Reading file chunks into a buffer");
-#endif
     const long logical_cores = get_processor_count();
 
     if (logical_cores == -1) {
@@ -282,8 +160,7 @@ int main(void) {
         exit(1);
     }
 
-    printf("Logical cores (sysconf): %ld\n", logical_cores);
-
+    printf("Logical cores: %ld\n", logical_cores);
 
     struct timespec start, stop;
 
