@@ -10,25 +10,23 @@ jobs:
   build:
     runs-on: ${{ matrix.os }}
 
+    defaults:
+      run:
+        shell: ${{ matrix.os == 'windows-latest' && 'msys2 {0}' || 'bash' }}
+
     strategy:
       fail-fast: false
       matrix:
-        # We define the specific configurations here
-        include:
+        os: [ubuntu-latest, windows-latest]
+        c_compiler: [gcc, clang]
+        exclude:
           - os: windows-latest
-            c_compiler: gcc
-            shell: msys2 {0}
-          - os: ubuntu-latest
-            c_compiler: gcc
-            shell: bash
-          - os: ubuntu-latest
             c_compiler: clang
-            shell: bash
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Setup MSYS2 (Windows only)
+      - name: Setup MSYS2
         if: matrix.os == 'windows-latest'
         uses: msys2/setup-msys2@v2
         with:
@@ -39,15 +37,13 @@ jobs:
             mingw-w64-x86_64-cmake
             mingw-w64-x86_64-ninja
 
-      - name: Set reusable strings
+      - name: Set build directory
         id: strings
-        shell: bash # Bash is always available on GitHub runners for simple logic
+        shell: bash
         run: |
           echo "build-output-dir=${{ github.workspace }}/build" >> "$GITHUB_OUTPUT"
 
       - name: Configure CMake
-        # Now we use the shell defined in our matrix
-        shell: ${{ matrix.shell }}
         run: >
           cmake -B ${{ steps.strings.outputs.build-output-dir }}
           -G Ninja
@@ -56,10 +52,8 @@ jobs:
           -S ${{ github.workspace }}
 
       - name: Build
-        shell: ${{ matrix.shell }}
         run: cmake --build ${{ steps.strings.outputs.build-output-dir }}
 
       - name: Test
-        shell: ${{ matrix.shell }}
         working-directory: ${{ steps.strings.outputs.build-output-dir }}
         run: ctest
