@@ -14,6 +14,26 @@
 long get_processor_count() {
     return GetActiveProcessorCount(ALL_PROCESSOR_GROUPS); // NOLINT(*-narrowing-conversions)
 }
+
+typedef struct close_file_map_instructions {
+    char *map;
+    HANDLE file_handle;
+} close_map_instructions;
+
+DWORD WINAPI close_map_windows(void *args) {
+    const close_map_instructions instructions = *(close_map_instructions *)args;
+
+    if (UnmapViewOfFile(instructions.map) == 0) {
+         printf("failed to unmap windows file\n");
+    }
+
+    if (CloseHandle(instructions.file_handle) == 0)
+    {
+        printf("failed to close windows file mapping\n");
+    }
+    free(args);
+    return 0;
+}
 #else
 #include <pthread.h>
 #include <unistd.h>
@@ -130,7 +150,7 @@ puzzle_reader read_puzzles_threaded(const char *filename, const long num_threads
         exit(1);
     }
 
-    const char *puzzle_data = MapViewOfFile(file_mapping, FILE_MAP_READ, 0, 0, 0) + PUZZLE_FILE_HEADER_SIZE;
+    char *puzzle_data = MapViewOfFile(file_mapping, FILE_MAP_READ, 0, 0, 0) + PUZZLE_FILE_HEADER_SIZE;
     if (puzzle_data == NULL) {
         printf("windows file map view failed!\n");
         exit(1);
@@ -187,15 +207,21 @@ puzzle_reader read_puzzles_threaded(const char *filename, const long num_threads
     free(hThreads);
     free(dwThreadIds);
 
-    // TODO: figure out a way to do this that doesn't double clocked execution time
-    // if (UnmapViewOfFile(puzzle_data - PUZZLE_FILE_HEADER_SIZE) == 0) {
-    //     printf("failed to unmap windows file\n");
-    // }
+    /*
+     * Windows file unmapping freezes the caller thread until it's finished,
+     * which can as much as double execution time. To avoid this, I'm spawning
+     * a thread to take care of cleanup.
+     */
 
-    // if (CloseHandle(file_mapping) == 0)
-    // {
-    //     printf("failed to close windows file mapping\n");
-    // }
+    //  the thread frees this; I can't do it as the caller because
+    //  I don't know how long the thread will need it
+    close_map_instructions *unmap_instructions = malloc(sizeof(close_map_instructions));
+
+     unmap_instructions -> map = puzzle_data - PUZZLE_FILE_HEADER_SIZE;
+     unmap_instructions -> file_handle = file_mapping;
+
+     // if the program terminates before the thread finishes, windows should take care of cleanup
+    CreateThread(NULL, 0, close_map_windows, unmap_instructions, 0, NULL);
 
 #else
     for (int i = 0; i < num_threads; i++) {
