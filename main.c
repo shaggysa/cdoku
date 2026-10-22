@@ -9,40 +9,17 @@
 #define MAX_PUZZLES_PER_CHUNK 50000
 #define CHUNK_SIZE (PUZZLES_PER_CHUNK * PUZZLE_FILE_ROW_SIZE)
 
-#ifdef _WIN32
-#include <windows.h>
-long get_processor_count() {
-    return GetActiveProcessorCount(ALL_PROCESSOR_GROUPS); // NOLINT(*-narrowing-conversions)
-}
-
-typedef struct close_file_map_instructions {
-    char *map;
-    HANDLE file_handle;
-} close_map_instructions;
-
-DWORD WINAPI close_map_windows(void *args) {
-    const close_map_instructions instructions = *(close_map_instructions *)args;
-
-    if (UnmapViewOfFile(instructions.map) == 0) {
-         printf("failed to unmap windows file\n");
-    }
-
-    if (CloseHandle(instructions.file_handle) == 0)
-    {
-        printf("failed to close windows file mapping\n");
-    }
-    free(args);
-    return 0;
-}
-#else
 #include <pthread.h>
+#include <stdbool.h>
 #include <unistd.h>
 #include <sys/mman.h>
 #include <sys/fcntl.h>
+
+static int num_solved = 0;
+
 long get_processor_count() {
     return sysconf(_SC_NPROCESSORS_ONLN);
 }
-#endif
 
 typedef struct thread_instructions {
     long num_puzzles;
@@ -51,11 +28,13 @@ typedef struct thread_instructions {
     uint8_t (*unsolved)[81];
     uint8_t (*solved)[81];
 } thread_instructions;
-#ifdef _WIN32
-DWORD WINAPI read_puzzles(void *args) {
-#else
+
+struct pz_empty_element {
+    int idx;
+    struct pz_empty_element *next;
+};
+
 void *read_puzzles(void *args) {
-#endif
 
     const thread_instructions instructions = *(thread_instructions *)args;
 
@@ -69,16 +48,124 @@ void *read_puzzles(void *args) {
             exit(1);
         }
 
+        uint16_t rows[9] = {0};
+        uint16_t cols[9] = {0};
+        uint16_t squares[3][3] = {0};
+        struct pz_empty_element empty_elements[81] = {0};
+        struct pz_empty_element *head = NULL;
+        struct pz_empty_element *tail = NULL;
+
         for (int j = 0; j < 81; j++) {
-            instructions.unsolved[p][j] = buff[j + puzzle_idx] - '0';
+            uint8_t unsolved_num = buff[j + puzzle_idx] - '0';
+
+            // if the original value was below '0' the subtraction will cause an underflow and the value will be > 9
+            if (unsolved_num > 9) {
+                printf("Invalid puzzle square!");
+                exit(1);
+            }
+
+            if (unsolved_num == 0) {
+                empty_elements[j].idx = j;
+                if (head != NULL) {
+                    tail->next = &empty_elements[j];
+                    tail = &empty_elements[j];
+                } else {
+                    head = &empty_elements[j];
+                    tail = head;
+                }
+            }
+
+            const int row = j / 9;
+            const int col = j % 9;
+
+            const uint16_t mask = 1 << unsolved_num;
+            rows[row] |= mask;
+            cols[col] |= mask;
+            squares[row / 3][col / 3] |= mask;
+
+
+            instructions.unsolved[p][j] = unsolved_num;
             instructions.solved[p][j] = buff[j + puzzle_idx + 82] - '0';
         }
+
+        bool solved = false;
+
+        // this presolver gets about 82% of the 9 million puzzles in the kaggle dataset
+        while (true) {
+            bool modified = false;
+            struct pz_empty_element *ll_head = head;
+
+            // take care of all the leading elements first,
+            // we can't set prev->next if prev is invalid
+            while (true) {
+                const int row = ll_head->idx / 9;
+                const int col = ll_head->idx % 9;
+
+                // set a bit for each possibility, forcing the zeroth bit to be a 0
+                const uint16_t possibilities = ~(rows[row] | cols[col] | squares[row / 3][col / 3]) & 0b1111111110;
+
+                // if only one bit is set, the position only has a single possibility
+                // we can get that possibility by adding one to the number of trailing zeros in the possibilities mask
+                // zero is still technically in the bitmask, so 0b0000010 would indicate that 1 is the only possibility
+                if (__builtin_popcount(possibilities) == 1) {
+                    const uint8_t value = __builtin_ctz(possibilities);
+                    instructions.unsolved[p][ll_head->idx] = value;
+
+                    // update the row, column, and square occupied bitmasks
+                    rows[row] |= possibilities;
+                    cols[col] |= possibilities;
+                    squares[row / 3][col / 3] |= possibilities;
+
+                    // if we run through the whole puzzle, we know it's solved
+                    if (ll_head->next == NULL) {
+                        solved = true;
+                        goto solved;
+                    }
+                    modified = true;
+                    ll_head = ll_head->next;
+                    head = ll_head;
+                } else {
+                    break;
+                }
+            }
+
+            struct pz_empty_element *prev = ll_head;
+
+            while (ll_head != NULL) {
+                const int row = ll_head->idx / 9;
+                const int col = ll_head->idx % 9;
+
+                const uint16_t possibilities = ~(rows[row] | cols[col] | squares[row / 3][col / 3]) & 0b1111111110;
+                 if (__builtin_popcount(possibilities) == 1) {
+                     const uint8_t value = __builtin_ctz(possibilities);
+                     instructions.unsolved[p][ll_head->idx] = value;
+
+                     rows[row] |= possibilities;
+                     cols[col] |= possibilities;
+                     squares[row / 3][col / 3] |= possibilities;
+
+                     prev->next = ll_head->next;
+
+                     modified = true;
+                 } else {
+                     prev = ll_head;
+                 }
+                ll_head = ll_head->next;
+            }
+
+            if (!modified) {
+                break;
+            }
+        }
+
+    /// TODO: Proper backtracking solver to solve the remaining 1.7 million puzzles
+
+    solved:
+        if (solved) {
+            __atomic_fetch_add(&num_solved, 1, __ATOMIC_RELAXED);
+        }
     }
-#ifdef _WIN32
-    return 0;
-#else
     return NULL;
-#endif
 }
 
 
@@ -118,44 +205,17 @@ puzzle_reader read_puzzles_threaded(const char *filename, const long num_threads
         printf("failed to allocate thread instructions!\n");
         exit(1);
     }
-#ifdef _WIN32
-    DWORD   *dwThreadIds = malloc(sizeof(DWORD) * num_threads);
-    HANDLE  *hThreads = malloc(sizeof(HANDLE) * num_threads);
-    if (dwThreadIds == NULL || hThreads == NULL) {
-        printf("failed to allocate windows thread array!\n");
-        exit(1);
-    }
-#else
+
     pthread_t *threads = malloc(sizeof(pthread_t) * num_threads);
     if (threads == NULL) {
         printf("failed to allocate thread array!");
         exit(1);
     }
-#endif
 
 
     fclose(file);
 
-#ifdef _WIN32
-    HANDLE file_handle = CreateFileA(filename, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-    if (file_handle == INVALID_HANDLE_VALUE) {
-        printf("failed to create a windows file handle!\n");
-        exit(1);
-    }
 
-    HANDLE file_mapping = CreateFileMappingA(file_handle, NULL, PAGE_READONLY, 0, 0, NULL);
-    CloseHandle(file_handle);
-    if (file_mapping == NULL) {
-        printf("failed to create a windows file mapping!\n");
-        exit(1);
-    }
-
-    char *puzzle_data = MapViewOfFile(file_mapping, FILE_MAP_READ, 0, 0, 0) + PUZZLE_FILE_HEADER_SIZE;
-    if (puzzle_data == NULL) {
-        printf("windows file map view failed!\n");
-        exit(1);
-    }
-#else
     const int fd = open(filename, O_RDONLY);
 
     if (fd == -1) {
@@ -170,7 +230,6 @@ puzzle_reader read_puzzles_threaded(const char *filename, const long num_threads
         perror("mmap");
         exit(1);
     }
-#endif
 
     const long puzzles_per_thread = num_puzzles / num_threads;
     const long extra_puzzles = num_puzzles % num_threads;
@@ -183,47 +242,14 @@ puzzle_reader read_puzzles_threaded(const char *filename, const long num_threads
         instructions[i].puzzle_file = puzzle_data + allocated_puzzles * PUZZLE_FILE_ROW_SIZE;
         instructions[i].unsolved = unsolved + allocated_puzzles;
         instructions[i].solved = solved + allocated_puzzles;
-#ifdef _WIN32
-        hThreads[i] = CreateThread(NULL, 0, read_puzzles, instructions + i, 0, dwThreadIds + i);
-        if (hThreads[i] == 0) {
-            printf("failed to create a WINAPI thread!\n");
-            exit(1);
-        }
-#else
+
         if (pthread_create(threads + i, NULL, read_puzzles, instructions + i) != 0) {
             perror("pthread creation");
             exit(1);
         }
-#endif
         allocated_puzzles += thread_puzzles;
     }
-#ifdef _WIN32
-    WaitForMultipleObjects(num_threads, hThreads, TRUE, INFINITE);
-    for (int i = 0; i < num_threads; i++) {
-        if (CloseHandle(hThreads[i]) == 0) {
-            printf("failed to close windows thread\n");
-        }
-    }
-    free(hThreads);
-    free(dwThreadIds);
 
-    /*
-     * Windows file unmapping freezes the caller thread until it's finished,
-     * which can as much as double execution time. To avoid this, I'm spawning
-     * a thread to take care of cleanup.
-     */
-
-    //  the thread frees this; I can't do it as the caller because
-    //  I don't know how long the thread will need it
-    close_map_instructions *unmap_instructions = malloc(sizeof(close_map_instructions));
-
-     unmap_instructions -> map = puzzle_data - PUZZLE_FILE_HEADER_SIZE;
-     unmap_instructions -> file_handle = file_mapping;
-
-     // if the program terminates before the thread finishes, windows should take care of cleanup
-    CreateThread(NULL, 0, close_map_windows, unmap_instructions, 0, NULL);
-
-#else
     for (int i = 0; i < num_threads; i++) {
         pthread_join(threads[i], NULL);
     }
@@ -231,12 +257,9 @@ puzzle_reader read_puzzles_threaded(const char *filename, const long num_threads
     if (munmap(puzzle_data - PUZZLE_FILE_HEADER_SIZE, file_size) == -1) {
         perror("failed to unmap puzzle file");
     }
-#endif
+
     free(instructions);
 
-#ifdef _WIN32
-    CloseHandle(file_mapping - PUZZLE_FILE_HEADER_SIZE);
-#endif
 
     const puzzle_reader puzzles = {
         num_puzzles,
@@ -252,7 +275,12 @@ void destroy_puzzles(const puzzle_reader reader) {
     free(reader.unsolved);
 }
 
-int main(void) {
+int main(int argc, char **argv) {
+    if (argc < 2) {
+        perror("Missing puzzle file path");
+        exit(1);
+    }
+
     const long logical_cores = get_processor_count();
 
     if (logical_cores == -1) {
@@ -266,7 +294,7 @@ int main(void) {
 
     clock_gettime( CLOCK_REALTIME, &start);
 
-    const puzzle_reader reader = read_puzzles_threaded("../sudoku.csv", logical_cores * 2);
+    const puzzle_reader reader = read_puzzles_threaded(argv[1], logical_cores * 2);
 
     clock_gettime( CLOCK_REALTIME, &stop);
 
@@ -274,7 +302,7 @@ int main(void) {
             + (double)( stop.tv_nsec - start.tv_nsec )
               / (double)BILLION;
 
-    printf("Read and parsed %ld puzzles in %f milliseconds (%f ns / puzzle)\n", reader.num_puzzles, delta * 1000, delta * 1000000000 / reader.num_puzzles ); // NOLINT(*-narrowing-conversions)
+    printf("Read and parsed %ld puzzles, solved %d puzzles (%.2f%%) with the presolver in %f milliseconds (%f ns / puzzle)\n", reader.num_puzzles, num_solved, (num_solved / (float) reader.num_puzzles) * 100, delta * 1000, delta * 1000000000 / reader.num_puzzles ); // NOLINT(*-narrowing-conversions)
 
     destroy_puzzles(reader);
 
