@@ -11,13 +11,12 @@
 
 #include <pthread.h>
 #include <stdbool.h>
+#include <string.h>
 #include <unistd.h>
 #include <sys/mman.h>
 #include <sys/fcntl.h>
 
-static int num_solved = 0;
-
-long get_processor_count() {
+static long get_processor_count() {
     return sysconf(_SC_NPROCESSORS_ONLN);
 }
 
@@ -25,16 +24,12 @@ typedef struct thread_instructions {
     long num_puzzles;
     const char *puzzle_file;
 
-    uint8_t (*unsolved)[81];
+    uint8_t (*to_solve)[81];
     uint8_t (*solved)[81];
 } thread_instructions;
 
-struct pz_empty_element {
-    int idx;
-    struct pz_empty_element *next;
-};
 
-void *read_puzzles(void *args) {
+static void *read_puzzles(void *args) {
 
     const thread_instructions instructions = *(thread_instructions *)args;
 
@@ -51,9 +46,9 @@ void *read_puzzles(void *args) {
         uint16_t rows[9] = {0};
         uint16_t cols[9] = {0};
         uint16_t squares[3][3] = {0};
-        struct pz_empty_element empty_elements[81] = {0};
-        struct pz_empty_element *head = NULL;
-        struct pz_empty_element *tail = NULL;
+        uint8_t empty_elements[81] = {0};
+        int empty_elements_len = 0;
+
 
         for (int j = 0; j < 81; j++) {
             uint8_t unsolved_num = buff[j + puzzle_idx] - '0';
@@ -65,14 +60,7 @@ void *read_puzzles(void *args) {
             }
 
             if (unsolved_num == 0) {
-                empty_elements[j].idx = j;
-                if (head != NULL) {
-                    tail->next = &empty_elements[j];
-                    tail = &empty_elements[j];
-                } else {
-                    head = &empty_elements[j];
-                    tail = head;
-                }
+                empty_elements[empty_elements_len++] = j;
             }
 
             const int row = j / 9;
@@ -84,22 +72,18 @@ void *read_puzzles(void *args) {
             squares[row / 3][col / 3] |= mask;
 
 
-            instructions.unsolved[p][j] = unsolved_num;
+            instructions.to_solve[p][j] = unsolved_num;
             instructions.solved[p][j] = buff[j + puzzle_idx + 82] - '0';
         }
 
-        bool solved = false;
 
-        // this presolver gets about 82% of the 9 million puzzles in the kaggle dataset
         while (true) {
             bool modified = false;
-            struct pz_empty_element *ll_head = head;
+            for (int i = 0; i < empty_elements_len; i++) {
+                int empty_idx = empty_elements[i];
 
-            // take care of all the leading elements first,
-            // we can't set prev->next if prev is invalid
-            while (true) {
-                const int row = ll_head->idx / 9;
-                const int col = ll_head->idx % 9;
+                int row = empty_idx / 9;
+                int col = empty_idx % 9;
 
                 // set a bit for each possibility, forcing the zeroth bit to be a 0
                 const uint16_t possibilities = ~(rows[row] | cols[col] | squares[row / 3][col / 3]) & 0b1111111110;
@@ -109,48 +93,24 @@ void *read_puzzles(void *args) {
                 // zero is still technically in the bitmask, so 0b0000010 would indicate that 1 is the only possibility
                 if (__builtin_popcount(possibilities) == 1) {
                     const uint8_t value = __builtin_ctz(possibilities);
-                    instructions.unsolved[p][ll_head->idx] = value;
+                    instructions.to_solve[p][empty_idx] = value;
+                    modified = true;
 
                     // update the row, column, and square occupied bitmasks
                     rows[row] |= possibilities;
                     cols[col] |= possibilities;
                     squares[row / 3][col / 3] |= possibilities;
 
-                    // if we run through the whole puzzle, we know it's solved
-                    if (ll_head->next == NULL) {
-                        solved = true;
+                    // move the last empty element into this element's slot and decrement the length
+                    empty_elements[i] = empty_elements[empty_elements_len - 1];
+
+                    if (--empty_elements_len == 0) {
                         goto solved;
                     }
-                    modified = true;
-                    ll_head = ll_head->next;
-                    head = ll_head;
-                } else {
-                    break;
+
+                    // decrement the iterator to avoid skipping the element we just moved
+                    i--;
                 }
-            }
-
-            struct pz_empty_element *prev = ll_head;
-
-            while (ll_head != NULL) {
-                const int row = ll_head->idx / 9;
-                const int col = ll_head->idx % 9;
-
-                const uint16_t possibilities = ~(rows[row] | cols[col] | squares[row / 3][col / 3]) & 0b1111111110;
-                 if (__builtin_popcount(possibilities) == 1) {
-                     const uint8_t value = __builtin_ctz(possibilities);
-                     instructions.unsolved[p][ll_head->idx] = value;
-
-                     rows[row] |= possibilities;
-                     cols[col] |= possibilities;
-                     squares[row / 3][col / 3] |= possibilities;
-
-                     prev->next = ll_head->next;
-
-                     modified = true;
-                 } else {
-                     prev = ll_head;
-                 }
-                ll_head = ll_head->next;
             }
 
             if (!modified) {
@@ -158,11 +118,92 @@ void *read_puzzles(void *args) {
             }
         }
 
-    /// TODO: Proper backtracking solver to solve the remaining 1.7 million puzzles
+        uint16_t cached_possibilities[81] = {0};
+        uint16_t all_possibilities[81] = {0};
+
+        for (int i = 0; i < empty_elements_len; i++) {
+            int idx = empty_elements[i];
+
+            int row = idx / 9;
+            int col = idx % 9;
+            const uint16_t possibilities = ~(rows[row] | cols[col] | squares[row / 3][col / 3]) & 0b1111111110;
+            cached_possibilities[idx] = possibilities;
+            all_possibilities[idx] = possibilities;
+        }
+
+        // sort the list of empty elements by idx
+        // sorting by number of possibilities is substantially slower, perhaps because of memory pipelining?
+        for (int i = 1; i < empty_elements_len; i++) {
+            const int key = empty_elements[i];
+            int j = i - 1;
+
+            while (j >= 0 && empty_elements[j] > key) {
+                empty_elements[j + 1] = empty_elements[j];
+                j -= 1;
+            }
+            empty_elements[j + 1] = key;
+        }
+
+        int empty_idx = 0;
+        while (empty_idx < empty_elements_len) {
+            if (empty_idx < 0) {
+                printf("Encountered an unsolvable puzzle!");
+                exit(1);
+            }
+
+            int actual_idx = empty_elements[empty_idx];
+            int row = actual_idx / 9;
+            int col = actual_idx % 9;
+
+            const u_int16_t cached = cached_possibilities[actual_idx];
+
+            if (__builtin_popcount(cached) == 0) {
+                const uint8_t old_value = instructions.to_solve[p][actual_idx];
+                const uint16_t old_value_bitmask = 1 << old_value;
+
+                // clear the old value from the occupied bitmasks
+                rows[row] ^= old_value_bitmask;
+                cols[col] ^= old_value_bitmask;
+                squares[row / 3][col / 3] ^= old_value_bitmask;
+
+                // reset the possibilities for this square
+                instructions.to_solve[p][actual_idx] = 0;
+                cached_possibilities[actual_idx] = all_possibilities[actual_idx];
+                empty_idx--;
+                continue;
+            }
+
+            const uint8_t next_possibility = __builtin_ctz(cached);
+
+            const uint16_t next_possibility_bitmask = 1 << next_possibility;
+
+            cached_possibilities[actual_idx] ^= next_possibility_bitmask;
+
+            const uint16_t real_possibilities = ~(rows[row] | cols[col] | squares[row / 3][col / 3]);
+
+            if (real_possibilities & next_possibility_bitmask) {
+                const uint16_t old_value_bitmask = 1 << instructions.to_solve[p][actual_idx];
+
+                // clear the old value and add the new one to the occupied bitmasks
+                // the zeroth bit is ignored when reading the bitmask, so it is fine to flip it to a 1
+                rows[row] ^= old_value_bitmask;
+                cols[col] ^= old_value_bitmask;
+                squares[row / 3][col / 3] ^= old_value_bitmask;
+
+                rows[row] |= next_possibility_bitmask;
+                cols[col] |= next_possibility_bitmask;
+                squares[row / 3][col / 3] |= next_possibility_bitmask;
+
+                instructions.to_solve[p][actual_idx] = next_possibility;
+                empty_idx++;
+            }
+        }
 
     solved:
-        if (solved) {
-            __atomic_fetch_add(&num_solved, 1, __ATOMIC_RELAXED);
+        // ensure that the file-defined solved puzzle is the same as our solved puzzle
+        if (memcmp(instructions.to_solve[p], instructions.solved[p], 81) != 0) {
+            printf("Found a different puzzle solution than the one defined in the puzzle file.");
+            exit(1);
         }
     }
     return NULL;
@@ -192,10 +233,10 @@ puzzle_reader read_puzzles_threaded(const char *filename, const long num_threads
 
     fseek(file, PUZZLE_FILE_HEADER_SIZE, SEEK_SET);
 
-    uint8_t (*unsolved)[PUZZLE_SIZE] = malloc(num_puzzles * sizeof(uint8_t[PUZZLE_SIZE]));
+    uint8_t (*to_solve)[PUZZLE_SIZE] = malloc(num_puzzles * sizeof(uint8_t[PUZZLE_SIZE]));
     uint8_t (*solved)[PUZZLE_SIZE] = malloc(num_puzzles * sizeof(uint8_t[PUZZLE_SIZE]));
 
-    if (unsolved == NULL || solved == NULL) {
+    if (to_solve == NULL || solved == NULL) {
         printf("Failed to allocate the solved or unsolved array!\n");
         exit(1);
     }
@@ -240,7 +281,7 @@ puzzle_reader read_puzzles_threaded(const char *filename, const long num_threads
 
         instructions[i].num_puzzles = thread_puzzles;
         instructions[i].puzzle_file = puzzle_data + allocated_puzzles * PUZZLE_FILE_ROW_SIZE;
-        instructions[i].unsolved = unsolved + allocated_puzzles;
+        instructions[i].to_solve = to_solve + allocated_puzzles;
         instructions[i].solved = solved + allocated_puzzles;
 
         if (pthread_create(threads + i, NULL, read_puzzles, instructions + i) != 0) {
@@ -263,7 +304,7 @@ puzzle_reader read_puzzles_threaded(const char *filename, const long num_threads
 
     const puzzle_reader puzzles = {
         num_puzzles,
-        unsolved,
+        to_solve,
         solved
     };
 
@@ -294,7 +335,7 @@ int main(int argc, char **argv) {
 
     clock_gettime( CLOCK_REALTIME, &start);
 
-    const puzzle_reader reader = read_puzzles_threaded(argv[1], logical_cores * 2);
+    const puzzle_reader reader = read_puzzles_threaded(argv[1], logical_cores);
 
     clock_gettime( CLOCK_REALTIME, &stop);
 
@@ -302,7 +343,7 @@ int main(int argc, char **argv) {
             + (double)( stop.tv_nsec - start.tv_nsec )
               / (double)BILLION;
 
-    printf("Read and parsed %ld puzzles, solved %d puzzles (%.2f%%) with the presolver in %f milliseconds (%f ns / puzzle)\n", reader.num_puzzles, num_solved, (num_solved / (float) reader.num_puzzles) * 100, delta * 1000, delta * 1000000000 / reader.num_puzzles ); // NOLINT(*-narrowing-conversions)
+    printf("Read, solved, and validated %ld puzzles in %.2f milliseconds (%.2f ns / puzzle)\n", reader.num_puzzles, delta * 1000, delta * 1000000000 / reader.num_puzzles ); // NOLINT(*-narrowing-conversions)
 
     destroy_puzzles(reader);
 
