@@ -335,7 +335,7 @@ int main(int argc, char **argv) {
 
     clock_gettime( CLOCK_REALTIME, &start);
 
-    const puzzle_reader reader = read_puzzles_threaded(argv[1], 1);
+    const puzzle_reader reader = read_puzzles_threaded(argv[1], logical_cores);
 
     clock_gettime( CLOCK_REALTIME, &stop);
 
