@@ -5,10 +5,6 @@ set(CMAKE_C_COMPILER "gcc")
 
 set(CMAKE_C_STANDARD 99)
 
-add_library(cdoku SHARED library.c)
+add_executable(cdoku main.c)
 
-add_executable(test_runner main.c)
-
-target_link_libraries(test_runner cdoku)
-
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3 -march=native")
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3")

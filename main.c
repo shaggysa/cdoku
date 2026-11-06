@@ -1,4 +1,3 @@
-#include "library.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <inttypes.h>
@@ -8,6 +7,8 @@
 #define BILLION  1000000000L
 #define MAX_PUZZLES_PER_CHUNK 50000
 #define CHUNK_SIZE (PUZZLES_PER_CHUNK * PUZZLE_FILE_ROW_SIZE)
+#define PUZZLE_FILE_HEADER_SIZE 16
+#define PUZZLE_FILE_ROW_SIZE 164
 
 #include <pthread.h>
 #include <stdbool.h>
@@ -26,6 +27,7 @@ typedef struct thread_instructions {
 
     uint8_t (*to_solve)[81];
     uint8_t (*solved)[81];
+    double *solve_times;
 } thread_instructions;
 
 
@@ -36,6 +38,10 @@ static void *read_puzzles(void *args) {
     const char *buff = instructions.puzzle_file;
 
     for (int p = 0; p < instructions.num_puzzles; p++) {
+        struct timespec start, stop;
+
+        clock_gettime( CLOCK_REALTIME, &start);
+
         const int puzzle_idx = p * PUZZLE_FILE_ROW_SIZE;
 
         if (buff[81 + puzzle_idx] != ',') {
@@ -48,7 +54,6 @@ static void *read_puzzles(void *args) {
         uint16_t squares[3][3] = {0};
         uint8_t empty_elements[81] = {0};
         int empty_elements_len = 0;
-
 
         for (int j = 0; j < 81; j++) {
             uint8_t unsolved_num = buff[j + puzzle_idx] - '0';
@@ -145,6 +150,7 @@ static void *read_puzzles(void *args) {
         }
 
         int empty_idx = 0;
+
         while (empty_idx < empty_elements_len) {
             if (empty_idx < 0) {
                 printf("Encountered an unsolvable puzzle!");
@@ -157,7 +163,7 @@ static void *read_puzzles(void *args) {
 
             const u_int16_t cached = cached_possibilities[actual_idx];
 
-            if (__builtin_popcount(cached) == 0) {
+            if (cached == 0) {
                 const uint8_t old_value = instructions.to_solve[p][actual_idx];
                 const uint16_t old_value_bitmask = 1 << old_value;
 
@@ -205,6 +211,13 @@ static void *read_puzzles(void *args) {
             printf("Found a different puzzle solution than the one defined in the puzzle file.");
             exit(1);
         }
+        clock_gettime( CLOCK_REALTIME, &stop);
+
+        const double solve_time = stop.tv_sec - start.tv_sec // NOLINT(*-narrowing-conversions)
+                + (double)( stop.tv_nsec - start.tv_nsec )
+                  / (double)BILLION;
+
+        instructions.solve_times[p] = solve_time;
     }
     return NULL;
 }
@@ -212,8 +225,9 @@ static void *read_puzzles(void *args) {
 
 typedef struct puzzle_reader {
     long num_puzzles;
-    uint8_t (*unsolved)[PUZZLE_SIZE];
+    uint8_t (*to_solve)[PUZZLE_SIZE];
     uint8_t (*solved)[PUZZLE_SIZE];
+    double *solve_times;
 } puzzle_reader;
 
 puzzle_reader read_puzzles_threaded(const char *filename, const long num_threads) {
@@ -235,8 +249,9 @@ puzzle_reader read_puzzles_threaded(const char *filename, const long num_threads
 
     uint8_t (*to_solve)[PUZZLE_SIZE] = malloc(num_puzzles * sizeof(uint8_t[PUZZLE_SIZE]));
     uint8_t (*solved)[PUZZLE_SIZE] = malloc(num_puzzles * sizeof(uint8_t[PUZZLE_SIZE]));
+    double *solve_times = malloc(num_puzzles * sizeof(double));
 
-    if (to_solve == NULL || solved == NULL) {
+    if (to_solve == NULL || solved == NULL || solve_times == NULL) {
         printf("Failed to allocate the solved or unsolved array!\n");
         exit(1);
     }
@@ -253,9 +268,7 @@ puzzle_reader read_puzzles_threaded(const char *filename, const long num_threads
         exit(1);
     }
 
-
     fclose(file);
-
 
     const int fd = open(filename, O_RDONLY);
 
@@ -283,6 +296,7 @@ puzzle_reader read_puzzles_threaded(const char *filename, const long num_threads
         instructions[i].puzzle_file = puzzle_data + allocated_puzzles * PUZZLE_FILE_ROW_SIZE;
         instructions[i].to_solve = to_solve + allocated_puzzles;
         instructions[i].solved = solved + allocated_puzzles;
+        instructions[i].solve_times = solve_times + allocated_puzzles;
 
         if (pthread_create(threads + i, NULL, read_puzzles, instructions + i) != 0) {
             perror("pthread creation");
@@ -305,7 +319,8 @@ puzzle_reader read_puzzles_threaded(const char *filename, const long num_threads
     const puzzle_reader puzzles = {
         num_puzzles,
         to_solve,
-        solved
+        solved,
+        solve_times
     };
 
     return puzzles;
@@ -313,29 +328,30 @@ puzzle_reader read_puzzles_threaded(const char *filename, const long num_threads
 
 void destroy_puzzles(const puzzle_reader reader) {
     free(reader.solved);
-    free(reader.unsolved);
+    free(reader.to_solve);
 }
 
-int main(int argc, char **argv) {
+
+int main(int argc, char **argv) {\
     if (argc < 2) {
-        perror("Missing puzzle file path");
+        printf("Usage: ./cdoku <path_to_puzzle_file>");
         exit(1);
     }
 
-    const long logical_cores = get_processor_count();
+    long threads = get_processor_count();
 
-    if (logical_cores == -1) {
-        perror("Logical core count unavailable.");
-        exit(1);
+    if (threads == -1) {
+        perror("Logical core count unavailable, defaulting to 16 threads");
+        threads = 16;
     }
 
-    printf("Logical cores: %ld\n", logical_cores);
+    printf("Starting solver with %ld threads\n", threads);
 
     struct timespec start, stop;
 
     clock_gettime( CLOCK_REALTIME, &start);
 
-    const puzzle_reader reader = read_puzzles_threaded(argv[1], logical_cores);
+    const puzzle_reader reader = read_puzzles_threaded(argv[1], threads);
 
     clock_gettime( CLOCK_REALTIME, &stop);
 
@@ -343,7 +359,24 @@ int main(int argc, char **argv) {
             + (double)( stop.tv_nsec - start.tv_nsec )
               / (double)BILLION;
 
-    printf("Read, solved, and validated %ld puzzles in %.2f milliseconds (%.2f ns / puzzle)\n", reader.num_puzzles, delta * 1000, delta * 1000000000 / reader.num_puzzles ); // NOLINT(*-narrowing-conversions)
+    printf("\nRead, solved, and validated %ld puzzles in %.2f seconds (%.2f ns/puzzle average)\n", reader.num_puzzles, delta, delta * 1000000000 / reader.num_puzzles ); // NOLINT(*-narrowing-conversions)
+
+    double min = (double)INT64_MAX, max = 0, total = 0;
+
+    for (int i = 0; i < reader.num_puzzles; i++) {
+        double solve_time = reader.solve_times[i];
+
+        total += solve_time;
+
+        if (solve_time < min) {
+            min = solve_time;
+        }
+        if (solve_time > max) {
+            max = solve_time;
+        }
+    }
+
+    printf("Min solve time: %.2f ns, max solve time: %.2f ms\nTotal solve time (across all threads): %.02f ms (%.2f μs/puzzle average)", min * 1000000000, max * 1000, total * 1000, (total * 1000000) / reader.num_puzzles); // NOLINT(*-narrowing-conversions)
 
     destroy_puzzles(reader);
 
